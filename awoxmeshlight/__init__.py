@@ -11,10 +11,10 @@ import time
 # Commands :
 
 #: Set mesh groups.
-#: Data : 3 bytes  
+#: Data : 3 bytes
 C_MESH_GROUP = 0xd7
 
-#: Set the mesh id. The light will still answer to the 0 mesh id. Calling the 
+#: Set the mesh id. The light will still answer to the 0 mesh id. Calling the
 #: command again replaces the previous mesh id.
 #: Data : the new mesh id, 2 bytes in little endian order
 C_MESH_ADDRESS = 0xe0
@@ -28,28 +28,28 @@ C_POWER = 0xd0
 #: Data : one byte
 C_LIGHT_MODE = 0x33
 
-#: Data : one byte 0 to 6 
+#: Data : one byte 0 to 6
 C_PRESET = 0xc8
 
 #: White temperature. one byte 0 to 0x7f
 C_WHITE_TEMPERATURE = 0xf0
 
-#: one byte 1 to 0x7f 
+#: one byte 1 to 0x7f
 C_WHITE_BRIGHTNESS = 0xf1
 
 #: 4 bytes : 0x4 red green blue
 C_COLOR = 0xe2
 
-#: one byte : 0xa to 0x64 .... 
-C_COLOR_BRIGHTNESS = 0xf2 
+#: one byte : 0xa to 0x64 ....
+C_COLOR_BRIGHTNESS = 0xf2
 
-#: Data 4 bytes : How long a color is displayed in a sequence in milliseconds as 
+#: Data 4 bytes : How long a color is displayed in a sequence in milliseconds as
 #:   an integer in little endian order
-C_SEQUENCE_COLOR_DURATION = 0xf5 
+C_SEQUENCE_COLOR_DURATION = 0xf5
 
-#: Data 4 bytes : Duration of the fading between colors in a sequence, in 
+#: Data 4 bytes : Duration of the fading between colors in a sequence, in
 #:   milliseconds, as an integer in little endian order
-C_SEQUENCE_FADE_DURATION = 0xf6 
+C_SEQUENCE_FADE_DURATION = 0xf6
 
 #: 7 bytes
 C_TIME = 0xe4
@@ -80,7 +80,12 @@ class Delegate(btle.DefaultDelegate):
             logger.info ("Receiced notification from characteristic %s", char.uuid.getCommonName ())
             message = pckt.decrypt_packet (self.light.session_key, self.light.mac, data)
             logger.info ("Received message : %s", repr (message))
-            
+            self.light.parseResult(message)
+
+def hex_to_rgb(value):
+    value = value.lstrip('#')
+    lv = len(value)
+    return tuple(int(value[i:i + lv // 3], 16) for i in range(0, lv, lv // 3))
 
 class AwoxMeshLight:
     def __init__ (self, mac, mesh_name = "unpaired", mesh_password = "1234"):
@@ -96,13 +101,16 @@ class AwoxMeshLight:
         self.session_key = None
         self.mesh_name = mesh_name.encode ()
         self.mesh_password = mesh_password.encode ()
-        
+
         # Light status
         self.white_brightness = None
         self.white_temp = None
+        self.color_brightness = None
         self.red = None
         self.green = None
         self.blue = None
+        self.mode = None
+        self.status = None
 
     def connect(self, mesh_name = None, mesh_password = None):
         """
@@ -119,7 +127,7 @@ class AwoxMeshLight:
         self.session_random = urandom(8)
         message = pckt.make_pair_packet (self.mesh_name, self.mesh_password, self.session_random)
         pair_char.write (message)
-        
+
         status_char = self.btdevice.getCharacteristics (uuid = STATUS_CHAR_UUID)[0]
         status_char.write (b'\x01')
 
@@ -150,7 +158,7 @@ class AwoxMeshLight:
             True on success.
         """
         assert (self.session_key)
-        
+
         pair_char = self.btdevice.getCharacteristics (uuid = PAIR_CHAR_UUID)[0]
 
         # FIXME : Removing the delegate as a workaround to a bluepy.btle.BTLEException
@@ -217,6 +225,51 @@ class AwoxMeshLight:
         """
         self.writeCommand (C_MESH_RESET, b'\x00')
 
+    def parseResult(self, message):
+        message = "".join("%02x" % b for b in message)
+        result  = {}
+        result['debug'] = message
+        meshid = int(message[6:8], 16)
+        mode = int(message[24:26], 16)
+
+        self.white_brightness = None
+        self.white_temp = None
+        self.red = None
+        self.green = None
+        self.blue = None
+
+        if mode < 40 and meshid == 0:     # filter some messages that return something else
+            result['status'] = mode%2
+            modestring = ''
+            if mode==1 or mode==5:
+                modestring = 'White'
+                mode=1
+            elif mode==3:
+                modestring = 'Color'
+            elif mode==7:
+                modestring = 'Transition'
+
+            if mode%2 == 1:
+                result['mode'] = mode
+                result['modestring'] = modestring
+
+            result['whitetemperature'] = int(int(message[28:30], 16)*100/127)  # convert to value from 0 to 100
+            result['whitebrightness'] = int(int(message[26:28], 16)*100/127)  # convert to value from 0 to 100
+            result['color'] = "#" + message[32:38]
+            result['colorbrightness'] = int(int(message[30:32], 16)*100/64)  # convert to value from 0 to 100
+
+            self.white_temp = int(int(message[28:30], 16)*100/127)  # convert to value from 0 to 100
+            self.white_brightness = int(int(message[26:28], 16)*100/127)  # convert to value from 0 to 100
+            self.color_brightness = int(int(message[30:32], 16)*100/64)  # convert to value from 0 to 100
+            color_array = hex_to_rgb(result['color'])
+            self.red = color_array[0]
+            self.green = color_array[1]
+            self.blue = color_array[2]
+            self.mode = mode
+            self.status = mode%2
+            self.parse_result = result
+        return result
+
     def readStatus (self):
         status_char = self.btdevice.getCharacteristics (uuid = STATUS_CHAR_UUID)[0]
         packet = status_char.read ()
@@ -264,6 +317,20 @@ class AwoxMeshLight:
         data = struct.pack('B', num)
         self.writeCommand (C_PRESET, data)
 
+    def setWhiteBrightness (self, brightness):
+        """
+        Args :
+            brightness: between 1 and 0x7f
+        """
+        data = struct.pack ('B', brightness)
+        self.writeCommand (C_WHITE_BRIGHTNESS, data)
+    def setWhiteTemperature (self, brightness):
+        """
+        Args :
+            brightness: between 1 and 0x7f
+        """
+        data = struct.pack ('B', brightness)
+        self.writeCommand (C_WHITE_TEMPERATURE, data)
     def setWhite (self, temp, brightness):
         """
         Args :
